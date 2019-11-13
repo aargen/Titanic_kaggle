@@ -1,0 +1,332 @@
+---
+title: "Feature Engineering"
+author: "Emanuele Costa"
+date: "11/03/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#rmarkdown::render('feature_engineering.Rmd')
+```
+
+```{r library, warning=FALSE, message=FALSE}
+library(dplyr)
+library(caret)
+library(Metrics)
+library(mice)
+library(car)
+library(rpart)
+library(tree.bins)
+```
+
+
+```{r load_titanic}
+train <- read.csv('train.csv', stringsAsFactors = F)
+test <- read.csv('test.csv', stringsAsFactors = F)
+test_labels <- test$PassengerId
+test$Survived <- NA
+
+str(train)
+train$PassengerId <- NULL
+set.seed(1997)
+```
+
+### Data Dictionary
+
+**pclass**: A proxy for socio-economic status (SES)
+
+* 1st = Upper
+* 2nd = Middle
+* 3rd = Lower
+
+**age**: Age is fractional if less than 1. If the age is estimated, is it in the form of xx.5
+
+**sibsp**: The dataset defines family relations in this way...
+
+* Sibling = brother, sister, stepbrother, stepsister
+* Spouse = husband, wife (mistresses and fiances were ignored)
+
+**parch**: The dataset defines family relations in this way...
+
+* Parent = mother, father
+* Child = daughter, son, stepdaughter, stepson
+* Some children travelled only with a nanny, therefore parch=0 for them.
+
+## Exploratory Data Analysis (EDA)
+
+
+```{r EDA}
+# Missing Values
+sapply(train, function(X) sum(is.na(X)))
+
+# let's factorize categorical variables
+train$Survived.F <- as.factor(train$Survived)
+train$Survived <- NULL
+train$Sex.F <- as.factor(train$Sex)
+train$Sex <- NULL
+train$Pclass.F <- as.factor(train$Pclass)
+train$PClass <- NULL
+
+# let's examine the three variables of interest
+
+ggplot(train, aes(x=Pclass,fill=Survived.F)) + geom_bar() + labs(fill = "Survived") + labs(title="Survivor split by ticket class")
+
+agebrackets <- c(0,13,18,30,55)
+train$Agebracket <- findInterval(train$Age,agebrackets)
+agetable <- data.frame(Agebracket=c(1,2,3,4,5),Age_range=c("<13","13-17","18-29","30-54","55+"))
+train.age <- merge(train,agetable,by="Agebracket", all=TRUE)
+train.age$Agebracket <- as.factor(train$Agebracket)
+
+ggplot(train.age, aes(x=Age_range,fill=Survived.F)) + geom_bar() + labs(fill = "Survived") + labs(title="Survivor split by Age")
+
+train$Agebracket <- NULL
+train.age <- NULL
+
+
+ggplot(train, aes(x=Sex.F,fill=Survived.F)) + geom_bar() + labs(fill = "Survived") + labs(title="Survivor split by Sex")
+
+table(train$Cabin, useNA = 'always')
+#table(train$Ticket, useNA = 'always')
+train$Cabin[train$Cabin == ''] <- 'UN'
+train$Cabin[train$Cabin != ''] <- substr(train$Cabin, 1 , 1)
+table(train$Cabin)
+train$Cabin.F <- as.factor(train$Cabin)
+```
+
+## Train/Test split
+
+```{r trainvalidation}
+
+## 80% of the sample size
+smp_size <- floor(0.80 * nrow(train))
+train_ind <- sample(seq_len(nrow(train)), size = smp_size)
+ 
+split_train_val <- function(X) {   
+  train.sub <- X[train_ind, ]
+  validation.sub <- X[-train_ind, ]
+  val_labels <- validation.sub$Survived.F
+  validation.sub$Survived.F <- NULL
+  return(list(train.sub, validation.sub, val_labels))
+}
+
+```
+
+
+```{r first_regression}
+# 4-fold CV 
+fitControl <- trainControl(
+  method = "cv",
+  number = 4,
+  savePredictions = TRUE,
+  verboseIter=TRUE
+)
+
+table(train$Age, useNA = "always")
+## imputation we simply take the average age
+train$AgeImp1<- ifelse(is.na(train$Age), round(mean(train$Age, na.rm=TRUE)), train$Age)
+table(train$AgeImp1, useNA = "always")
+
+
+ret <- split_train_val(train)
+train.sub <- ret[[1]]
+validation.sub <- ret[[2]]
+val_labels <- ret[[3]]
+
+
+## Logistic regression
+lreg  <- train(Survived.F ~ AgeImp1 + Sex.F + Pclass.F,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+
+train$AgeImp1 <- NULL
+```
+
+
+```{r second_regression}
+
+tail(train[,c("Name","Age")], n=20)
+
+train$Title <- gsub('(.*, )|(\\..*)', '', train$Name)
+count(train,Title)
+
+ggplot(data=train, aes(x=Title, fill=Survived.F)) + geom_bar() + theme(axis.text.x = element_text(angle = 90, hjust = 1))  + labs(title="Survivor split by Title")
+
+mice_ages <- mice(train[, !names(train) %in% "Survived.F"], method='rf')
+mice_out <- complete(mice_ages)
+head(mice_out)
+table(mice_out$Age, useNA = "always")
+
+train$AgeImp2 <- mice_out$Age
+tail(train[,c("Survived.F","Name","AgeImp2")], n=20)
+
+ret <- split_train_val(train)
+train.sub <- ret[[1]]
+validation.sub <- ret[[2]]
+val_labels <- ret[[3]]
+
+## Logistic regression
+lreg  <- train(Survived.F ~ AgeImp2 + Sex.F + Pclass.F,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+
+```
+
+## Third Logistic Regression
+
+
+```{r sthird_regression}
+VIP <- c("Capt","Col","Don","Dona","Dr","Jonkheer","Lady","Major",
+         "Mlle", "Mme","Rev","Sir","the Countess")
+
+Title.orig <- train$Title
+train$Title[train$Title %in% VIP] <- "VIP"
+train$Title.F <- as.factor(train$Title)
+
+ret <- split_train_val(train)
+train.sub <- ret[[1]]
+validation.sub <- ret[[2]]
+val_labels <- ret[[3]]
+
+## Logistic regression
+lreg  <- train(Survived.F ~ AgeImp2 + Sex.F + Pclass.F + Title.F,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+
+glm.model <- glm(Survived.F ~ AgeImp2 + Sex.F + Pclass.F + Title.F, data = train.sub, family = binomial())
+vif(glm.model)
+
+
+# put back the original Title given we have a multicollinearity problem
+train$Title <- Title.orig
+train$Title.F <- as.factor(train$Title)
+
+```
+
+
+```{r binning_rf}
+sample.df <- train %>% select(Survived.F, Title.F)
+both <- tree.bins(data = sample.df, y = Survived.F, bin.nm = "bin#.", control = rpart.control(cp = .001), return = "both")
+head(both$new.fctrs, n=10)
+str(sample.df$Title.F)
+train$Title.F <- both$new.fctrs$Title.F
+
+
+# let's try again the regression
+ret <- split_train_val(train)
+train.sub <- ret[[1]]
+validation.sub <- ret[[2]]
+val_labels <- ret[[3]]
+
+## Logistic regression
+lreg  <- train(Survived.F ~ AgeImp2 + Sex.F + Pclass.F + Title.F,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+```
+
+
+## Random Forest
+
+
+```{r rf, fig.height=18, fig.width=30}
+lrf  <- train(Survived.F ~ AgeImp2 + Sex.F + Pclass.F + Title.F,data=train.sub,method="rf",family=binomial(),trControl=fitControl, tuneGrid = data.frame(mtry = 5))
+lrf
+
+plot(lrf$finalModel)
+
+# let's now predict
+lrf_pred <- predict(lrf, validation.sub)
+confusionMatrix(lrf_pred, val_labels)
+auc_val <- auc(val_labels, lrf_pred)
+print(auc_val)
+
+# Let's use a slightly different rf library to plot the potential tree
+preProcessInTrain<-c("center", "scale")
+metric_used<-"Accuracy"
+model <- train(
+  Survived.F ~ AgeImp2 + Sex.F + Pclass.F + Title.F, data = train,
+  method = "rpart",
+  trControl = fitControl,
+  metric=metric_used,
+  tuneLength = 10,
+  preProc = preProcessInTrain
+)
+library(rpart.plot)
+rpart.plot(model$finalModel)
+
+```
+
+## Age Binning
+
+```{r age_binning}
+
+AgeBracketF<-function(X){
+  if(X > 50){
+    return("old")
+  } 
+  else if(X<=50 & X>18){
+   return("adult")
+  }
+  else if(X<=18 & X>13){
+   return("teenager")
+  }
+  else{
+    return("child")
+  }
+}
+
+train$AgeBracket<- sapply(train$AgeImp2, function(X) AgeBracketF(X))
+train$AgeBracket.F <- as.factor(train$AgeBracket)
+
+# let's try again the regression
+ret <- split_train_val(train)
+train.sub <- ret[[1]]
+validation.sub <- ret[[2]]
+val_labels <- ret[[3]]
+
+## Logistic regression
+lreg  <- train(Survived.F ~ AgeBracket.F + Sex.F + Pclass.F + Title.F,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+
+```
+### Cabin
+```{r Cabin}
+
+## Logistic regression
+table(train$Ticket)
+
+lreg  <- train(Survived.F ~ AgeBracket.F + Pclass.F + Title.F + Fare,data=train.sub,method="glm",family=binomial(),trControl=fitControl)
+summary(lreg)
+
+# let's now predict
+lreg_pred <- predict(lreg, validation.sub)
+confusionMatrix(lreg_pred, val_labels)
+auc_val <- auc(val_labels, lreg_pred)
+print(auc_val)
+```
